@@ -546,8 +546,8 @@ async function loadAccounts() {
             badge + sid +
             '<div class="link" onclick="copyLink(this)" title="Click to copy">' + link + '</div>' +
             '<div class="actions">' +
-            '<button onclick="genLink(\'' + a.username + '\')">🔗 New Link</button>' +
-            '<button onclick="delAccount(\'' + a.username + '\')">🗑</button>' +
+            '<button onclick="genLink(&apos;' + a.username + '&apos;)">🔗 New Link</button>' +
+            '<button onclick="delAccount(&apos;' + a.username + '&apos;)">🗑</button>' +
             '</div></div>';
     });
 }
