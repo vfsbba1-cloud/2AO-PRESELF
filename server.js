@@ -485,24 +485,39 @@ const API = window.location.origin;
 let TOKEN = localStorage.getItem('2ao_token') || '';
 
 async function api(method, path, body) {
-    const opts = { method, headers: { 'Content-Type': 'application/json', 'X-Auth-Token': TOKEN } };
-    if (body) opts.body = JSON.stringify(body);
-    const r = await fetch(API + path, opts);
-    return r.json();
+    try {
+        const opts = { method, headers: { 'Content-Type': 'application/json', 'X-Auth-Token': TOKEN } };
+        if (body) opts.body = JSON.stringify(body);
+        const r = await fetch(API + path, opts);
+        return await r.json();
+    } catch(e) {
+        console.error('API Error:', e);
+        return { ok: false, error: e.message };
+    }
 }
 
 async function doLogin() {
-    const u = document.getElementById('iUser').value.trim();
-    const p = document.getElementById('iPass').value;
-    const d = await api('POST', '/api/login', { username: u, password: p });
-    if (d.ok) {
-        TOKEN = d.token;
-        localStorage.setItem('2ao_token', TOKEN);
-        document.getElementById('loginWrap').style.display = 'none';
-        document.getElementById('app').style.display = 'block';
-        loadAccounts();
-    } else {
-        document.getElementById('loginErr').textContent = 'Identifiants incorrects';
+    var err = document.getElementById('loginErr');
+    err.textContent = 'Connexion...';
+    err.style.color = '#f59e0b';
+    try {
+        const u = document.getElementById('iUser').value.trim();
+        const p = document.getElementById('iPass').value;
+        if (!u || !p) { err.textContent = 'Remplissez les champs'; err.style.color = '#ef4444'; return; }
+        const d = await api('POST', '/api/login', { username: u, password: p });
+        if (d.ok) {
+            TOKEN = d.token;
+            localStorage.setItem('2ao_token', TOKEN);
+            document.getElementById('loginWrap').style.display = 'none';
+            document.getElementById('app').style.display = 'block';
+            loadAccounts();
+        } else {
+            err.textContent = d.error || 'Identifiants incorrects';
+            err.style.color = '#ef4444';
+        }
+    } catch(e) {
+        err.textContent = 'Erreur: ' + e.message;
+        err.style.color = '#ef4444';
     }
 }
 
