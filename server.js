@@ -11,17 +11,32 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Video storage
 const VIDEOS_DIR = path.join(__dirname, 'videos');
+const DATA_FILE = path.join(__dirname, 'data.json');
 if (!fs.existsSync(VIDEOS_DIR)) fs.mkdirSync(VIDEOS_DIR);
+
 const upload = multer({ dest: VIDEOS_DIR, limits: { fileSize: 50 * 1024 * 1024 } });
 
-// ═══ CONFIG ═══
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || 'admin123';
 
-let accounts = {};
 let tokens = {};
+
+// ═══ PERSISTENCE ═══
+function loadData() {
+    try {
+        if (fs.existsSync(DATA_FILE)) {
+            return JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
+        }
+    } catch (e) { console.log('[DATA] Load error:', e.message); }
+    return {};
+}
+function saveData(accounts) {
+    try { fs.writeFileSync(DATA_FILE, JSON.stringify(accounts, null, 2)); }
+    catch (e) { console.log('[DATA] Save error:', e.message); }
+}
+let accounts = loadData();
+console.log('[DATA] Loaded ' + Object.keys(accounts).length + ' accounts');
 
 // ═══ AUTH ═══
 function auth(req, res, next) {
@@ -60,15 +75,15 @@ app.post('/api/accounts', auth, (req, res) => {
         video_path: null, video_mime: null,
         created_at: new Date().toISOString()
     };
+    saveData(accounts);
     res.json({ ok: true, username, selfie_code: code });
 });
 
 app.delete('/api/accounts/:username', auth, (req, res) => {
     const acc = accounts[req.params.username];
-    if (acc && acc.video_path) {
-        try { fs.unlinkSync(acc.video_path); } catch (e) {}
-    }
+    if (acc && acc.video_path) { try { fs.unlinkSync(acc.video_path); } catch (e) {} }
     delete accounts[req.params.username];
+    saveData(accounts);
     res.json({ ok: true });
 });
 
@@ -76,10 +91,10 @@ app.post('/api/accounts/:username/generate-link', auth, (req, res) => {
     const acc = accounts[req.params.username];
     if (!acc) return res.status(404).json({ ok: false });
     acc.selfie_code = crypto.randomBytes(4).toString('hex');
-    acc.status = 'pending';
-    acc.event_session_id = null;
+    acc.status = 'pending'; acc.event_session_id = null;
     if (acc.video_path) { try { fs.unlinkSync(acc.video_path); } catch (e) {} }
     acc.video_path = null;
+    saveData(accounts);
     const link = req.protocol + '://' + req.get('host') + '/selfie/' + acc.selfie_code;
     res.json({ ok: true, link, code: acc.selfie_code });
 });
@@ -87,296 +102,332 @@ app.post('/api/accounts/:username/generate-link', auth, (req, res) => {
 // ═══ SELFIE PAGE ═══
 app.get('/selfie/:code', (req, res) => {
     const entry = Object.entries(accounts).find(([u, d]) => d.selfie_code === req.params.code);
-    if (!entry) return res.status(404).send('Link invalid or expired');
+    if (!entry) return res.status(404).send('<h1>Lien invalide ou expire</h1>');
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(getSelfieHTML(req.params.code));
+    res.send(SELFIE_HTML.replace(/__CODE__/g, req.params.code));
 });
 
-// ═══ VIDEO UPLOAD (from selfie page) ═══
+// ═══ VIDEO UPLOAD ═══
 app.post('/api/upload-selfie/:code', upload.single('video'), (req, res) => {
     const code = req.params.code;
     const entry = Object.entries(accounts).find(([u, d]) => d.selfie_code === code);
     if (!entry) { if (req.file) fs.unlinkSync(req.file.path); return res.status(404).json({ ok: false }); }
-
     const [username, acc] = entry;
-    // Remove old video
     if (acc.video_path) { try { fs.unlinkSync(acc.video_path); } catch (e) {} }
-
-    // Save new
-    const ext = req.file.mimetype === 'video/mp4' ? '.mp4' : '.webm';
+    const ext = (req.file.mimetype || '').includes('mp4') ? '.mp4' : '.webm';
     const newPath = path.join(VIDEOS_DIR, code + ext);
     fs.renameSync(req.file.path, newPath);
-
-    acc.video_path = newPath;
-    acc.video_mime = req.file.mimetype;
-    acc.status = 'video_ready';
-    console.log('[SELFIE] Video saved for ' + username + ' (' + (req.file.size / 1024).toFixed(1) + 'KB)');
+    acc.video_path = newPath; acc.video_mime = req.file.mimetype; acc.status = 'video_ready';
+    saveData(accounts);
+    console.log('[SELFIE] Video saved: ' + username + ' (' + (req.file.size / 1024).toFixed(1) + 'KB)');
     res.json({ ok: true, status: 'video_ready' });
 });
 
 // ═══ AGENT API ═══
-// Get account status + check if video ready
 app.get('/api/agent/status/:username', auth, (req, res) => {
     const acc = accounts[req.params.username];
     if (!acc) return res.status(404).json({ ok: false });
-    res.json({
-        ok: true, status: acc.status,
-        has_video: !!acc.video_path,
-        event_session_id: acc.event_session_id
-    });
+    res.json({ ok: true, status: acc.status, has_video: !!acc.video_path, event_session_id: acc.event_session_id });
 });
 
-// Download video for webcam injection
 app.get('/api/agent/video/:username', auth, (req, res) => {
     const acc = accounts[req.params.username];
-    if (!acc || !acc.video_path) return res.status(404).json({ ok: false });
+    if (!acc || !acc.video_path || !fs.existsSync(acc.video_path)) return res.status(404).json({ ok: false });
     res.setHeader('Content-Type', acc.video_mime || 'video/webm');
-    res.sendFile(acc.video_path);
+    res.sendFile(path.resolve(acc.video_path));
 });
 
-// Agent reports the event_session_id after OZ SDK completes
 app.post('/api/agent/report-session', auth, (req, res) => {
     const { username, event_session_id } = req.body;
     const acc = accounts[username];
     if (!acc) return res.status(404).json({ ok: false });
-    acc.event_session_id = event_session_id;
-    acc.status = 'accepted';
-    console.log('[AGENT] Session ID for ' + username + ': ' + event_session_id);
+    acc.event_session_id = event_session_id; acc.status = 'accepted';
+    saveData(accounts);
+    console.log('[AGENT] Session: ' + username + ' → ' + event_session_id);
     res.json({ ok: true });
 });
-
-// ═══ HEALTH ═══
-app.get('/', (req, res) => res.json({
-    service: '2AO Selfie', version: '4.0', status: 'running',
-    accounts: Object.keys(accounts).length
-}));
 
 // ═══ DASHBOARD ═══
 app.get('/dashboard', (req, res) => {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(getDashboardHTML());
+    res.send(DASHBOARD_HTML);
 });
 
-// ═══ HTML GENERATORS ═══
-function getSelfieHTML(code) {
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Selfie Verification</title>
+app.get('/', (req, res) => res.json({ service: '2AO Selfie', version: '4.1', status: 'running', accounts: Object.keys(accounts).length }));
+
+// ═══════════════════════════════════════════
+// SELFIE HTML
+// ═══════════════════════════════════════════
+const SELFIE_HTML = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>2AO Selfie</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#0a0e17;color:#fff;font-family:system-ui;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:16px}
-h2{font-size:18px;margin-bottom:10px;color:#00E676;font-weight:800}
-.video-box{position:relative;width:300px;height:400px;border:3px solid #00E676;border-radius:16px;overflow:hidden;margin-bottom:10px;background:#000}
-video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
-.oval{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:60%;height:65%;border-radius:50%;border:3px dashed rgba(0,230,118,.5)}
-#status{text-align:center;padding:8px 16px;border-radius:8px;font-size:14px;font-weight:700;margin-bottom:8px;min-height:36px;display:flex;align-items:center;justify-content:center;gap:6px}
+body{background:#0a0e17;color:#fff;font-family:system-ui;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:12px}
+h2{font-size:18px;color:#00E676;font-weight:800;margin-bottom:8px}
+#camBox{position:relative;width:300px;height:400px;border:3px solid #00E676;border-radius:16px;overflow:hidden;background:#000}
+#camBox video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+#oval{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:58%;height:62%;border-radius:50%;border:3px dashed rgba(0,230,118,.5)}
+#st{text-align:center;padding:8px 14px;border-radius:8px;font-size:13px;font-weight:700;margin:10px 0;background:#1e293b}
 #overlay{position:fixed;inset:0;background:rgba(10,14,23,.95);display:none;flex-direction:column;align-items:center;justify-content:center;z-index:99}
-#overlay .spin{width:48px;height:48px;border:4px solid rgba(255,255,255,.1);border-top-color:#00E676;border-radius:50%;animation:sp .7s linear infinite;margin-bottom:14px}
-@keyframes sp{to{transform:rotate(360deg)}}
-.result{display:none;flex-direction:column;align-items:center;justify-content:center;text-align:center;min-height:100vh;gap:12px}
-.result .icon{font-size:72px}
-.result .msg{font-size:20px;font-weight:700}
-.result button{padding:12px 28px;background:#00E676;color:#000;border:none;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer}
-</style>
-</head>
-<body>
+#overlay .sp{width:44px;height:44px;border:4px solid rgba(255,255,255,.1);border-top-color:#00E676;border-radius:50%;animation:r .7s linear infinite;margin-bottom:12px}
+@keyframes r{to{transform:rotate(360deg)}}
+.res{display:none;flex-direction:column;align-items:center;justify-content:center;text-align:center;min-height:80vh;gap:10px}
+.res .ic{font-size:64px}.res .tx{font-size:20px;font-weight:700}
+.res button{padding:12px 24px;background:#00E676;color:#000;border:none;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer}
+</style></head><body>
 <h2>2AO Selfie</h2>
-<div id="camera-view">
-  <div class="video-box">
-    <video id="vid" autoplay muted playsinline></video>
-    <div class="oval" id="oval"></div>
-  </div>
-  <div id="status">Chargement...</div>
+<div id="camWrap">
+  <div id="camBox"><video id="vid" autoplay muted playsinline></video><div id="oval"></div></div>
+  <div id="st">Chargement...</div>
 </div>
-<div id="overlay"><div class="spin"></div><p style="color:#00E676;font-weight:700">Upload en cours...</p></div>
-<div class="result" id="resultOk"><div class="icon">&#10004;&#65039;</div><div class="msg" style="color:#00E676">Selfie enregistr&eacute; !</div><div style="color:#94a3b8;font-size:13px">Vous pouvez fermer cette page</div></div>
-<div class="result" id="resultFail"><div class="icon">&#10060;</div><div class="msg" style="color:#ef4444">Echec - R&eacute;essayez</div><button onclick="location.reload()">R&eacute;essayer</button></div>
+<div id="overlay"><div class="sp"></div><p style="color:#00E676;font-weight:700;font-size:16px">Upload...</p></div>
+<div class="res" id="resOK"><div class="ic">&#9989;</div><div class="tx" style="color:#00E676">Selfie enregistre!</div><div style="color:#94a3b8;font-size:13px">Vous pouvez fermer cette page</div></div>
+<div class="res" id="resFail"><div class="ic">&#10060;</div><div class="tx" style="color:#ef4444">Echec</div><button onclick="location.reload()">Reessayer</button></div>
 
-<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.min.js"></script>
 <script>
-var CODE='${code}',vid=document.getElementById('vid'),status=document.getElementById('status'),oval=document.getElementById('oval'),overlay=document.getElementById('overlay'),stream,recording=false,frontalStart=null;
+var CODE="__CODE__";
+var vid=document.getElementById("vid");
+var st=document.getElementById("st");
+var oval=document.getElementById("oval");
+var stream=null,recording=false,frontalStart=null;
+var faceReady=false;
 
-function setStatus(txt,bg){status.textContent=txt;status.style.background=bg;status.style.color=bg==='#10b981'?'#000':'#fff'}
+function setS(t,bg){st.textContent=t;st.style.background=bg||"#1e293b";st.style.color=bg==="#10b981"?"#000":"#fff"}
 
-async function init(){
-  setStatus('Chargement mod\\u00e8les...','#1e293b');
-  await faceapi.nets.tinyFaceDetector.loadFromUri('https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/');
-  await faceapi.nets.faceLandmark68Net.loadFromUri('https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/');
-  setStatus('Activation cam\\u00e9ra...','#1e293b');
-  stream=await navigator.mediaDevices.getUserMedia({video:{width:640,height:480,facingMode:'user'},audio:false});
-  vid.srcObject=stream;
-  await vid.play();
-  setStatus('Centrez votre visage dans l\\'ovale','#1e293b');
-  detect();
+// Load face-api from CDN
+function loadScript(url){
+  return new Promise(function(ok,fail){
+    var s=document.createElement("script");
+    s.src=url;s.onload=ok;s.onerror=fail;
+    document.head.appendChild(s);
+  });
+}
+
+async function start(){
+  try{
+    setS("Chargement modeles...");
+    await loadScript("https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.14/dist/face-api.min.js");
+    
+    var modelUrl="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.14/model/";
+    await faceapi.nets.tinyFaceDetector.loadFromUri(modelUrl);
+    await faceapi.nets.faceLandmark68Net.loadFromUri(modelUrl);
+    faceReady=true;
+    setS("Activation camera...");
+    
+    stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:640},height:{ideal:480},facingMode:"user"},audio:false});
+    vid.srcObject=stream;
+    vid.onloadedmetadata=function(){vid.play();setS("Centrez votre visage");detect()};
+  }catch(err){
+    setS("Erreur: "+err.message,"#ef4444");
+    console.error("Init error:",err);
+  }
 }
 
 function isFrontal(lm){
-  if(!lm)return false;
-  var le=lm.getLeftEye(),re=lm.getRightEye(),n=lm.getNose();
-  if(!le||!re||!n||!n[3])return false;
-  return Math.abs(n[3].x-(le[0].x+re[3].x)/2)<12;
+  try{
+    var le=lm.getLeftEye(),re=lm.getRightEye(),n=lm.getNose();
+    if(!le||!re||!n||!n[3])return false;
+    var dx=n[3].x-(le[0].x+re[3].x)/2;
+    return Math.abs(dx)<12;
+  }catch(e){return false}
 }
 
 function inOval(box){
   if(!box)return false;
-  var vw=vid.videoWidth,vh=vid.videoHeight,cx=vw/2,cy=vh/2,r=Math.min(vw,vh)*0.25;
-  return Math.hypot(box.x+box.width/2-cx,box.y+box.height/2-cy)<r;
+  var vw=vid.videoWidth,vh=vid.videoHeight;
+  var cx=vw/2,cy=vh/2,r=Math.min(vw,vh)*0.25;
+  var fx=box.x+box.width/2,fy=box.y+box.height/2;
+  return Math.hypot(fx-cx,fy-cy)<r;
 }
 
-async function detect(){
-  var opts=new faceapi.TinyFaceDetectorOptions({inputSize:160,scoreThreshold:0.5});
-  async function loop(){
-    if(!vid.videoWidth||recording){return}
-    var det=await faceapi.detectSingleFace(vid,opts).withFaceLandmarks();
-    if(det&&isFrontal(det.landmarks)&&inOval(det.detection.box)){
-      setStatus('\\u2705 Parfait ! Ne bougez pas...','#10b981');
-      oval.style.borderColor='#00E676';
-      if(!frontalStart)frontalStart=Date.now();
-      if(Date.now()-frontalStart>1500)return startRec();
-    }else if(det){
-      setStatus('\\u2194\\uFE0F Centrez votre visage','#f59e0b');
-      oval.style.borderColor='rgba(245,158,11,.8)';
-      frontalStart=null;
-    }else{
-      setStatus('\\uD83D\\uDC64 Aucun visage d\\u00e9tect\\u00e9','#ef4444');
-      oval.style.borderColor='rgba(239,68,68,.6)';
-      frontalStart=null;
-    }
-    requestAnimationFrame(loop);
+function detect(){
+  if(!faceReady)return;
+  var opts=new faceapi.TinyFaceDetectorOptions({inputSize:160,scoreThreshold:0.4});
+  
+  function loop(){
+    if(recording)return;
+    if(!vid.videoWidth){requestAnimationFrame(loop);return}
+    
+    faceapi.detectSingleFace(vid,opts).withFaceLandmarks().then(function(det){
+      if(det&&isFrontal(det.landmarks)&&inOval(det.detection.box)){
+        setS("Parfait! Ne bougez pas...","#10b981");
+        oval.style.borderColor="#00E676";
+        if(!frontalStart)frontalStart=Date.now();
+        if(Date.now()-frontalStart>1500){startRec();return}
+      }else if(det){
+        setS("Centrez votre visage","#f59e0b");
+        oval.style.borderColor="rgba(245,158,11,.8)";
+        frontalStart=null;
+      }else{
+        setS("Aucun visage detecte","#ef4444");
+        oval.style.borderColor="rgba(239,68,68,.6)";
+        frontalStart=null;
+      }
+      requestAnimationFrame(loop);
+    }).catch(function(e){
+      console.error("Detect err:",e);
+      requestAnimationFrame(loop);
+    });
   }
   loop();
 }
 
 function startRec(){
   recording=true;
-  setStatus('\\uD83D\\uDD34 Enregistrement...','#dc2626');
-  var mime=MediaRecorder.isTypeSupported('video/webm;codecs=vp8')?'video/webm;codecs=vp8':'video/mp4';
+  setS("Enregistrement...","#dc2626");
+  
+  var mime="video/webm";
+  if(typeof MediaRecorder!=="undefined"){
+    if(MediaRecorder.isTypeSupported("video/webm;codecs=vp8"))mime="video/webm;codecs=vp8";
+    else if(MediaRecorder.isTypeSupported("video/webm"))mime="video/webm";
+    else if(MediaRecorder.isTypeSupported("video/mp4"))mime="video/mp4";
+  }
+  
   var rec=new MediaRecorder(stream,{mimeType:mime});
   var chunks=[];
-  rec.ondataavailable=function(e){chunks.push(e.data)};
-  rec.onstop=function(){uploadVideo(new Blob(chunks,{type:mime}),mime)};
-  rec.start();
-  setTimeout(function(){rec.stop()},2500);
+  rec.ondataavailable=function(e){if(e.data&&e.data.size>0)chunks.push(e.data)};
+  rec.onstop=function(){
+    var blob=new Blob(chunks,{type:mime});
+    doUpload(blob);
+  };
+  rec.onerror=function(e){
+    console.error("Rec error:",e);
+    setS("Erreur enregistrement","#ef4444");
+  };
+  rec.start(100);
+  setTimeout(function(){
+    try{rec.stop()}catch(e){}
+    if(stream)stream.getTracks().forEach(function(t){t.stop()});
+  },2500);
 }
 
-async function uploadVideo(blob,mime){
-  document.getElementById('camera-view').style.display='none';
-  overlay.style.display='flex';
-  stream.getTracks().forEach(function(t){t.stop()});
+function doUpload(blob){
+  document.getElementById("camWrap").style.display="none";
+  document.getElementById("overlay").style.display="flex";
+  
   var form=new FormData();
-  var ext=mime.includes('mp4')?'.mp4':'.webm';
-  form.append('video',blob,CODE+ext);
-  try{
-    var r=await fetch('/api/upload-selfie/'+CODE,{method:'POST',body:form});
-    var d=await r.json();
-    overlay.style.display='none';
-    if(d.ok){document.getElementById('resultOk').style.display='flex'}
-    else{document.getElementById('resultFail').style.display='flex'}
-  }catch(e){
-    overlay.style.display='none';
-    document.getElementById('resultFail').style.display='flex';
-  }
+  form.append("video",blob,"selfie.webm");
+  
+  var xhr=new XMLHttpRequest();
+  xhr.open("POST","/api/upload-selfie/"+CODE);
+  xhr.onload=function(){
+    document.getElementById("overlay").style.display="none";
+    try{
+      var d=JSON.parse(xhr.responseText);
+      if(d.ok){document.getElementById("resOK").style.display="flex"}
+      else{document.getElementById("resFail").style.display="flex"}
+    }catch(e){document.getElementById("resFail").style.display="flex"}
+  };
+  xhr.onerror=function(){
+    document.getElementById("overlay").style.display="none";
+    document.getElementById("resFail").style.display="flex";
+  };
+  xhr.send(form);
 }
 
-init().catch(function(e){setStatus('Erreur: '+e.message,'#ef4444')});
-</script>
-</body>
-</html>`;
-}
+start();
+</script></body></html>`;
 
-function getDashboardHTML() {
-    return `<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+// ═══════════════════════════════════════════
+// DASHBOARD HTML
+// ═══════════════════════════════════════════
+const DASHBOARD_HTML = `<!DOCTYPE html>
+<html lang="fr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>2AO Dashboard</title>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#0a0e17;color:#e2e8f0;font-family:system-ui}
-.login-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh}
-.login-box{background:#111827;border:1px solid #1e3a5f;border-radius:16px;padding:32px;width:380px;text-align:center}
-.login-box h1{color:#00E676;font-size:28px;font-weight:900;margin-bottom:4px}
-.login-box p{color:#64748b;font-size:13px;margin-bottom:20px}
-.login-box input{width:100%;padding:12px;background:#0a0e17;border:1px solid #1e3a5f;border-radius:8px;color:#e2e8f0;font-size:14px;margin-bottom:10px;outline:none}
-.btn-green{width:100%;padding:12px;background:linear-gradient(135deg,#00C853,#00E676);color:#000;border:none;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer}
-#loginErr{color:#ef4444;font-size:12px;margin-top:6px;min-height:18px}
+*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0e17;color:#e2e8f0;font-family:system-ui}
+.lw{display:flex;align-items:center;justify-content:center;min-height:100vh}
+.lb{background:#111827;border:1px solid #1e3a5f;border-radius:16px;padding:32px;width:380px;text-align:center}
+.lb h1{color:#00E676;font-size:28px;font-weight:900;margin-bottom:4px}
+.lb p{color:#64748b;font-size:13px;margin-bottom:20px}
+.lb input{width:100%;padding:12px;background:#0a0e17;border:1px solid #1e3a5f;border-radius:8px;color:#e2e8f0;font-size:14px;margin-bottom:10px;outline:none}
+.bg{width:100%;padding:12px;background:linear-gradient(135deg,#00C853,#00E676);color:#000;border:none;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer}
+#lerr{color:#ef4444;font-size:12px;margin-top:6px;min-height:18px}
 #app{display:none}
-.topbar{background:#111827;border-bottom:1px solid #1e3a5f;padding:12px 20px;display:flex;align-items:center;gap:12px}
-.topbar h1{font-size:18px;color:#00E676;font-weight:800;flex:1}
-.topbar .cnt{background:rgba(0,230,118,.15);color:#00E676;padding:4px 12px;border-radius:6px;font-size:13px;font-weight:700}
-.topbar button{padding:6px 14px;border-radius:6px;border:1px solid #1e3a5f;background:#1e293b;color:#e2e8f0;font-size:12px;cursor:pointer}
-.toolbar{padding:12px 20px;display:flex;gap:8px;flex-wrap:wrap}
-.toolbar button{padding:8px 16px;border-radius:8px;border:none;font-size:13px;font-weight:600;cursor:pointer}
-.toolbar .add{background:#00E676;color:#000}
-.toolbar .del{background:#ef4444;color:#fff}
-.toolbar input{flex:1;min-width:150px;padding:8px 12px;background:#111827;border:1px solid #1e3a5f;border-radius:8px;color:#e2e8f0;font-size:13px;outline:none}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;padding:12px 20px}
-.card{background:#111827;border:1px solid #1e3a5f;border-radius:12px;padding:14px;position:relative}
-.card .user{font-weight:700;font-size:15px}
-.card .pass{font-size:12px;color:#64748b;margin-top:2px}
-.badge{display:inline-block;padding:3px 10px;border-radius:6px;font-size:11px;font-weight:700;margin-top:8px}
-.b-ok{background:rgba(16,185,129,.15);color:#10b981}
-.b-vid{background:rgba(59,130,246,.15);color:#3b82f6}
-.b-pn{background:rgba(245,158,11,.15);color:#f59e0b}
-.card .actions{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
-.card .actions button{padding:5px 10px;border-radius:6px;border:1px solid #1e3a5f;background:#1e293b;color:#e2e8f0;font-size:11px;cursor:pointer}
-.card .link{font-size:10px;color:#3b82f6;word-break:break-all;margin-top:6px;cursor:pointer}
-.card .sid{font-size:9px;color:#475569;word-break:break-all;margin-top:4px}
-.card .cb{position:absolute;top:12px;right:12px}
-.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:99}
-.modal{background:#111827;border:1px solid #1e3a5f;border-radius:16px;padding:24px;width:360px}
-.modal h3{color:#00E676;margin-bottom:12px}
-.modal input{width:100%;padding:10px;background:#0a0e17;border:1px solid #1e3a5f;border-radius:8px;color:#e2e8f0;font-size:13px;margin-bottom:8px;outline:none}
-.modal .btns{display:flex;gap:8px;margin-top:8px}
-.modal .btns button{flex:1;padding:8px;border-radius:8px;border:none;font-size:13px;font-weight:600;cursor:pointer}
-.toast{position:fixed;bottom:20px;right:20px;padding:12px 20px;border-radius:8px;font-size:13px;font-weight:600;z-index:999;display:none}
-</style>
-</head>
-<body>
-<div class="login-wrap" id="loginWrap">
-<div class="login-box">
-<h1>2AO SELFIE</h1><p>Dashboard v4.0</p>
-<input type="text" id="iUser" placeholder="Username" value="admin">
-<input type="password" id="iPass" placeholder="Password">
-<button class="btn-green" onclick="doLogin()">Connexion</button>
-<div id="loginErr"></div>
-</div></div>
-<div id="app">
-<div class="topbar"><h1>2AO SELFIE v4</h1><span class="cnt" id="totalCnt">0</span><button onclick="loadAccounts()">Refresh</button><button onclick="doLogout()">Logout</button></div>
-<div class="toolbar">
-<button class="add" onclick="showAdd()">+ Nouveau compte</button>
-<button class="del" onclick="bulkDel()">Supprimer</button>
-<input type="text" id="search" placeholder="Rechercher..." oninput="filterCards()">
-</div>
-<div class="grid" id="grid"></div>
-</div>
-<div class="modal-bg" id="modalBg"><div class="modal"><h3>Nouveau compte</h3>
-<input id="mUser" placeholder="Email BLS"><input id="mPass" placeholder="Mot de passe">
-<div class="btns"><button style="background:#1e293b;color:#e2e8f0" onclick="closeModal()">Annuler</button><button style="background:#00E676;color:#000" onclick="addAccount()">Ajouter</button></div>
-</div></div>
-<div class="toast" id="toast"></div>
+.top{background:#111827;border-bottom:1px solid #1e3a5f;padding:12px 20px;display:flex;align-items:center;gap:12px}
+.top h1{font-size:18px;color:#00E676;font-weight:800;flex:1}
+.top .c{background:rgba(0,230,118,.15);color:#00E676;padding:4px 12px;border-radius:6px;font-size:13px;font-weight:700}
+.top button{padding:6px 14px;border-radius:6px;border:1px solid #1e3a5f;background:#1e293b;color:#e2e8f0;font-size:12px;cursor:pointer}
+.tb{padding:12px 20px;display:flex;gap:8px;flex-wrap:wrap}
+.tb button{padding:8px 16px;border-radius:8px;border:none;font-size:13px;font-weight:600;cursor:pointer}
+.tb .a{background:#00E676;color:#000}.tb .d{background:#ef4444;color:#fff}
+.tb input{flex:1;min-width:150px;padding:8px 12px;background:#111827;border:1px solid #1e3a5f;border-radius:8px;color:#e2e8f0;font-size:13px;outline:none}
+.g{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;padding:12px 20px}
+.cd{background:#111827;border:1px solid #1e3a5f;border-radius:12px;padding:14px;position:relative}
+.cd .u{font-weight:700;font-size:15px}.cd .pw{font-size:12px;color:#64748b;margin-top:2px}
+.bd{display:inline-block;padding:3px 10px;border-radius:6px;font-size:11px;font-weight:700;margin-top:8px}
+.b1{background:rgba(16,185,129,.15);color:#10b981}
+.b2{background:rgba(59,130,246,.15);color:#3b82f6}
+.b3{background:rgba(245,158,11,.15);color:#f59e0b}
+.cd .act{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+.cd .act button{padding:5px 10px;border-radius:6px;border:1px solid #1e3a5f;background:#1e293b;color:#e2e8f0;font-size:11px;cursor:pointer}
+.cd .lk{font-size:10px;color:#3b82f6;word-break:break-all;margin-top:6px;cursor:pointer}
+.cd .si{font-size:9px;color:#475569;word-break:break-all;margin-top:4px}
+.cd .cb{position:absolute;top:12px;right:12px}
+.mb{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:99}
+.ml{background:#111827;border:1px solid #1e3a5f;border-radius:16px;padding:24px;width:360px}
+.ml h3{color:#00E676;margin-bottom:12px}
+.ml input{width:100%;padding:10px;background:#0a0e17;border:1px solid #1e3a5f;border-radius:8px;color:#e2e8f0;font-size:13px;margin-bottom:8px;outline:none}
+.ml .bt{display:flex;gap:8px;margin-top:8px}
+.ml .bt button{flex:1;padding:8px;border-radius:8px;border:none;font-size:13px;font-weight:600;cursor:pointer}
+.tt{position:fixed;bottom:20px;right:20px;padding:12px 20px;border-radius:8px;font-size:13px;font-weight:600;z-index:999;display:none}
+</style></head><body>
+<div class="lw" id="lw"><div class="lb"><h1>2AO SELFIE</h1><p>Dashboard v4.1</p>
+<input type="text" id="iu" placeholder="Username" value="admin">
+<input type="password" id="ip" placeholder="Password">
+<button class="bg" id="btnL">Connexion</button>
+<div id="lerr"></div></div></div>
+<div id="app"><div class="top"><h1>2AO SELFIE</h1><span class="c" id="cnt">0</span><button id="btnR">Refresh</button><button id="btnO">Logout</button></div>
+<div class="tb"><button class="a" id="btnA">+ Nouveau</button><button class="d" id="btnD">Supprimer</button><input type="text" id="sch" placeholder="Rechercher..." oninput="flt()"></div>
+<div class="g" id="grd"></div></div>
+<div class="mb" id="mbg"><div class="ml"><h3>Nouveau compte</h3><input id="mu" placeholder="Email BLS"><input id="mp" placeholder="Mot de passe">
+<div class="bt"><button style="background:#1e293b;color:#e2e8f0" id="btnMC">Annuler</button><button style="background:#00E676;color:#000" id="btnMS">Ajouter</button></div></div></div>
+<div class="tt" id="tt"></div>
 <script>
-var API=location.origin,TOKEN=localStorage.getItem('2ao_tk')||'';
-async function api(m,p,b){try{var o={method:m,headers:{'Content-Type':'application/json','X-Auth-Token':TOKEN}};if(b)o.body=JSON.stringify(b);var r=await fetch(API+p,o);return await r.json()}catch(e){return{ok:false,error:e.message}}}
-async function doLogin(){var err=document.getElementById('loginErr');err.textContent='Connexion...';err.style.color='#f59e0b';try{var u=document.getElementById('iUser').value.trim(),p=document.getElementById('iPass').value;if(!u||!p){err.textContent='Remplissez les champs';err.style.color='#ef4444';return}var d=await api('POST','/api/login',{username:u,password:p});if(d.ok){TOKEN=d.token;localStorage.setItem('2ao_tk',TOKEN);document.getElementById('loginWrap').style.display='none';document.getElementById('app').style.display='block';loadAccounts()}else{err.textContent=d.error||'Erreur';err.style.color='#ef4444'}}catch(e){err.textContent='Erreur: '+e.message;err.style.color='#ef4444'}}
-function doLogout(){TOKEN='';localStorage.removeItem('2ao_tk');location.reload()}
-async function loadAccounts(){var d=await api('GET','/api/accounts');if(!d.ok){doLogout();return}document.getElementById('totalCnt').textContent=d.total;var g=document.getElementById('grid');g.innerHTML='';d.accounts.forEach(function(a){var link=API+'/selfie/'+a.selfie_code;var badge=a.status==='accepted'?'<span class="badge b-ok">Accepted</span>':a.status==='video_ready'?'<span class="badge b-vid">Video Ready</span>':'<span class="badge b-pn">Pending</span>';var sid=a.event_session_id?'<div class="sid">ID: '+a.event_session_id+'</div>':'';g.innerHTML+='<div class="card" data-user="'+a.username+'"><input type="checkbox" class="cb" data-u="'+a.username+'"><div class="user">'+a.username+'</div><div class="pass">'+a.password+'</div>'+badge+sid+'<div class="link" onclick="copyTxt(this)" title="Cliquer pour copier">'+link+'</div><div class="actions"><button onclick="genLink(&apos;'+a.username+'&apos;)">New Link</button><button onclick="delAcc(&apos;'+a.username+'&apos;)">Supprimer</button></div></div>'})}
-function copyTxt(el){navigator.clipboard.writeText(el.textContent);toast('Lien copie!','#10b981')}
-async function genLink(u){var d=await api('POST','/api/accounts/'+encodeURIComponent(u)+'/generate-link');if(d.ok){toast('Nouveau lien genere','#3b82f6');loadAccounts()}}
-async function delAcc(u){if(!confirm('Supprimer '+u+'?'))return;await api('DELETE','/api/accounts/'+encodeURIComponent(u));loadAccounts()}
-async function bulkDel(){var cbs=document.querySelectorAll('.cb:checked');if(!cbs.length)return;if(!confirm('Supprimer '+cbs.length+' comptes?'))return;for(var i=0;i<cbs.length;i++)await api('DELETE','/api/accounts/'+encodeURIComponent(cbs[i].dataset.u));loadAccounts()}
-function showAdd(){document.getElementById('modalBg').style.display='flex'}
-function closeModal(){document.getElementById('modalBg').style.display='none'}
-async function addAccount(){var u=document.getElementById('mUser').value.trim(),p=document.getElementById('mPass').value;if(!u)return;await api('POST','/api/accounts',{username:u,password:p});closeModal();document.getElementById('mUser').value='';document.getElementById('mPass').value='';loadAccounts()}
-function filterCards(){var q=document.getElementById('search').value.toLowerCase();document.querySelectorAll('.card').forEach(function(c){c.style.display=c.dataset.user.toLowerCase().includes(q)?'':'none'})}
-function toast(msg,bg){var t=document.getElementById('toast');t.textContent=msg;t.style.background=bg;t.style.color='#fff';t.style.display='block';setTimeout(function(){t.style.display='none'},3000)}
-if(TOKEN)api('GET','/api/accounts').then(function(d){if(d.ok){document.getElementById('loginWrap').style.display='none';document.getElementById('app').style.display='block';loadAccounts()}});
-document.getElementById('iPass').addEventListener('keydown',function(e){if(e.key==='Enter')doLogin()});
-</script>
-</body></html>`;
-}
+var API=location.origin,TK=localStorage.getItem("2ao_tk")||"";
+function $(i){return document.getElementById(i)}
+function tt(m,c){var t=$("tt");t.textContent=m;t.style.background=c;t.style.color="#fff";t.style.display="block";setTimeout(function(){t.style.display="none"},3000)}
+async function api(m,p,b){try{var o={method:m,headers:{"Content-Type":"application/json","X-Auth-Token":TK}};if(b)o.body=JSON.stringify(b);var r=await fetch(API+p,o);return await r.json()}catch(e){return{ok:false,error:e.message}}}
 
-app.listen(PORT, () => console.log('\n  2AO Selfie Server v4.0\n  Port: ' + PORT + '\n  Dashboard: /dashboard\n  Ready!\n'));
+$("btnL").onclick=async function(){
+  var e=$("lerr");e.textContent="Connexion...";e.style.color="#f59e0b";
+  var u=$("iu").value.trim(),p=$("ip").value;
+  if(!u||!p){e.textContent="Remplissez les champs";e.style.color="#ef4444";return}
+  var d=await api("POST","/api/login",{username:u,password:p});
+  if(d.ok){TK=d.token;localStorage.setItem("2ao_tk",TK);$("lw").style.display="none";$("app").style.display="block";load()}
+  else{e.textContent=d.error||"Erreur";e.style.color="#ef4444"}
+};
+$("btnO").onclick=function(){TK="";localStorage.removeItem("2ao_tk");location.reload()};
+$("btnR").onclick=load;
+$("btnA").onclick=function(){$("mbg").style.display="flex"};
+$("btnMC").onclick=function(){$("mbg").style.display="none"};
+$("btnMS").onclick=async function(){var u=$("mu").value.trim(),p=$("mp").value;if(!u)return;await api("POST","/api/accounts",{username:u,password:p});$("mbg").style.display="none";$("mu").value="";$("mp").value="";load()};
+$("btnD").onclick=async function(){var c=document.querySelectorAll(".cb:checked");if(!c.length)return;if(!confirm("Supprimer "+c.length+" comptes?"))return;for(var i=0;i<c.length;i++)await api("DELETE","/api/accounts/"+encodeURIComponent(c[i].dataset.u));load()};
+$("ip").onkeydown=function(e){if(e.key==="Enter")$("btnL").onclick()};
+
+async function load(){
+  var d=await api("GET","/api/accounts");
+  if(!d.ok){$("btnO").onclick();return}
+  $("cnt").textContent=d.total;
+  var g=$("grd");g.innerHTML="";
+  d.accounts.forEach(function(a){
+    var lk=API+"/selfie/"+a.selfie_code;
+    var bd=a.status==="accepted"?'<span class="bd b1">Accepted</span>':a.has_video?'<span class="bd b2">Video Ready</span>':'<span class="bd b3">Pending</span>';
+    var si=a.event_session_id?'<div class="si">'+a.event_session_id+"</div>":"";
+    var eu=encodeURIComponent(a.username);
+    g.innerHTML+='<div class="cd" data-user="'+a.username+'"><input type="checkbox" class="cb" data-u="'+a.username+'"><div class="u">'+a.username+'</div><div class="pw">'+a.password+'</div>'+bd+si+'<div class="lk" onclick="navigator.clipboard.writeText(this.textContent)">'+lk+'</div><div class="act"><button data-gl="'+eu+'">New Link</button><button data-dl="'+eu+'">Suppr</button></div></div>';
+  });
+  document.querySelectorAll("[data-gl]").forEach(function(b){b.onclick=function(){gl(b.dataset.gl)}});
+  document.querySelectorAll("[data-dl]").forEach(function(b){b.onclick=function(){dl(b.dataset.dl)}});
+  document.querySelectorAll(".lk").forEach(function(l){l.onclick=function(){navigator.clipboard.writeText(l.textContent);tt("Copie!","#10b981")}});
+}
+async function gl(u){await api("POST","/api/accounts/"+u+"/generate-link");tt("Nouveau lien","#3b82f6");load()}
+async function dl(u){if(!confirm("Supprimer?"))return;await api("DELETE","/api/accounts/"+u);load()}
+function flt(){var q=$("sch").value.toLowerCase();document.querySelectorAll(".cd").forEach(function(c){c.style.display=c.dataset.user.toLowerCase().includes(q)?"":"none"})}
+
+if(TK)api("GET","/api/accounts").then(function(d){if(d.ok){$("lw").style.display="none";$("app").style.display="block";load()}});
+</script></body></html>`;
+
+app.listen(PORT, () => console.log('  2AO Selfie v4.1 | Port ' + PORT + ' | /dashboard'));
