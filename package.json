@@ -2,7 +2,7 @@
   "name": "2ao-selfie-server",
   "version": "4.0.0",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
+  "scripts": { "start": "node server.js", "build": "echo done" },
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
